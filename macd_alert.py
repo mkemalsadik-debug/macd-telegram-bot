@@ -1,6 +1,11 @@
 import os
+import json
 import requests
 import pandas as pd
+
+# ==========================================
+# AYARLAR
+# ==========================================
 
 SYMBOLS = [
     "BTCUSDT",
@@ -31,11 +36,71 @@ CHAT_ID = "1921028034"
 
 BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
+STATE_FILE = "state.json"
+
+
+# ==========================================
+# STATE
+# ==========================================
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+        return {}
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            return json.load(file)
+
+    except Exception as e:
+
+        print("State okunamadı:", e)
+        return {}
+
+
+def save_state(state):
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                state,
+                file,
+                indent=2,
+                ensure_ascii=False
+            )
+
+    except Exception as e:
+
+        print("State kaydedilemedi:", e)
+
+
+state = load_state()
+
+
+# ==========================================
+# TELEGRAM
+# ==========================================
 
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    requests.post(
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    response = requests.post(
         url,
         data={
             "chat_id": CHAT_ID,
@@ -44,6 +109,12 @@ def send_telegram(message):
         timeout=10
     )
 
+    response.raise_for_status()
+
+
+# ==========================================
+# BINANCE FUTURES VERİSİ
+# ==========================================
 
 def get_data(symbol, interval):
 
@@ -78,12 +149,19 @@ def get_data(symbol, interval):
         "ignore"
     ]
 
-    df = pd.DataFrame(data, columns=columns)
+    df = pd.DataFrame(
+        data,
+        columns=columns
+    )
 
     df["close"] = df["close"].astype(float)
 
     return df
 
+
+# ==========================================
+# MACD
+# ==========================================
 
 def calculate_macd(df):
 
@@ -107,23 +185,28 @@ def calculate_macd(df):
     return df
 
 
+# ==========================================
+# KAPANMIŞ MUMDA CROSS KONTROLÜ
+# ==========================================
+
 def check_cross(df):
 
-    # -1 = halen oluşan mum
-    # -2 = son kapanmış mum
-    # -3 = ondan önceki kapanmış mum
+    # Son mum (-1) halen oluşuyor olabilir.
+    # Bu nedenle sadece kapanmış mumları kullanıyoruz.
 
     previous = df.iloc[-3]
     current = df.iloc[-2]
 
     bullish = (
         previous["macd"] <= previous["signal"]
-        and current["macd"] > current["signal"]
+        and
+        current["macd"] > current["signal"]
     )
 
     bearish = (
         previous["macd"] >= previous["signal"]
-        and current["macd"] < current["signal"]
+        and
+        current["macd"] < current["signal"]
     )
 
     if bullish:
@@ -135,7 +218,13 @@ def check_cross(df):
     return None
 
 
+# ==========================================
+# ANA KONTROL
+# ==========================================
+
+print("==========================================")
 print("MACD kontrolü başladı.")
+print("==========================================")
 
 for symbol in SYMBOLS:
 
@@ -143,16 +232,69 @@ for symbol in SYMBOLS:
 
         try:
 
-            df = get_data(symbol, interval)
+            # ----------------------------------
+            # Binance verisini al
+            # ----------------------------------
+
+            df = get_data(
+                symbol,
+                interval
+            )
+
+            # ----------------------------------
+            # MACD hesapla
+            # ----------------------------------
+
             df = calculate_macd(df)
+
+            # ----------------------------------
+            # Kapanmış mumda cross kontrolü
+            # ----------------------------------
 
             cross = check_cross(df)
 
             if cross:
 
+                # Kapanmış cross mumunun zamanı
+                candle_time = str(
+                    df.iloc[-2]["open_time"]
+                )
+
+                # Her coin/timeframe için ayrı state
+                state_key = (
+                    f"{symbol}_{timeframe_name}"
+                )
+
+                # Bu cross'un benzersiz kimliği
+                signal_id = (
+                    f"{candle_time}_{cross}"
+                )
+
+                # Daha önce gönderilmiş mi?
+                last_signal = state.get(
+                    state_key
+                )
+
+                if last_signal == signal_id:
+
+                    print(
+                        f"Tekrar yok | "
+                        f"{symbol} | "
+                        f"{timeframe_name}"
+                    )
+
+                    continue
+
+                # ----------------------------------
+                # Yeni cross
+                # ----------------------------------
+
                 if cross == "BULLISH":
+
                     emoji = "🟢"
+
                 else:
+
                     emoji = "🔴"
 
                 message = (
@@ -160,26 +302,45 @@ for symbol in SYMBOLS:
                     f"Coin: {symbol}\n"
                     f"Zaman: {timeframe_name}\n"
                     f"Yön: {cross}\n"
-                    f"MACD: {df.iloc[-2]['macd']:.6f}\n"
-                    f"Signal: {df.iloc[-2]['signal']:.6f}"
+                    f"MACD: "
+                    f"{df.iloc[-2]['macd']:.6f}\n"
+                    f"Signal: "
+                    f"{df.iloc[-2]['signal']:.6f}"
                 )
 
+                # Telegram gönder
                 send_telegram(message)
 
                 print(
-                    f"{emoji} {symbol} {timeframe_name} {cross}"
+                    f"{emoji} "
+                    f"{symbol} "
+                    f"{timeframe_name} "
+                    f"{cross}"
                 )
+
+                # Gönderilen cross'u kaydet
+                state[state_key] = signal_id
+
+                save_state(state)
 
             else:
 
                 print(
-                    f"Yok | {symbol} | {timeframe_name}"
+                    f"Yok | "
+                    f"{symbol} | "
+                    f"{timeframe_name}"
                 )
 
         except Exception as e:
 
             print(
-                f"HATA | {symbol} | {timeframe_name} | {e}"
+                f"HATA | "
+                f"{symbol} | "
+                f"{timeframe_name} | "
+                f"{e}"
             )
 
+
+print("==========================================")
 print("MACD kontrolü tamamlandı.")
+print("==========================================")
