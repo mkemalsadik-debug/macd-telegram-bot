@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 import pandas as pd
 
@@ -21,26 +20,10 @@ SYMBOLS = [
 ]
 
 TIMEFRAMES = {
-    "2H": {
-        "type": "hour",
-        "aggregate": 2,
-        "seconds": 2 * 60 * 60
-    },
-    "4H": {
-        "type": "hour",
-        "aggregate": 4,
-        "seconds": 4 * 60 * 60
-    },
-    "12H": {
-        "type": "hour",
-        "aggregate": 12,
-        "seconds": 12 * 60 * 60
-    },
-    "1D": {
-        "type": "day",
-        "aggregate": 1,
-        "seconds": 24 * 60 * 60
-    }
+    "2H": "120",
+    "4H": "240",
+    "12H": "720",
+    "1D": "D"
 }
 
 MACD_FAST = 12
@@ -50,45 +33,9 @@ MACD_SIGNAL = 9
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = "1921028034"
 
-CRYPTOCOMPARE_URL = "https://min-api.cryptocompare.com/data/v2"
+BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 
 STATE_FILE = "state.json"
-
-
-# ==========================================
-# STATE
-# ==========================================
-
-def load_state():
-
-    if not os.path.exists(STATE_FILE):
-        return {}
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    except Exception:
-        return {}
-
-
-def save_state(state):
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-
-state = load_state()
 
 
 # ==========================================
@@ -98,185 +45,89 @@ state = load_state()
 def send_telegram(message):
 
     if not TELEGRAM_TOKEN:
-        print("HATA | TELEGRAM_TOKEN bulunamadı.")
-        return False
+        raise Exception("TELEGRAM_TOKEN bulunamadi.")
 
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
-    try:
-
-        response = requests.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        return True
-
-    except Exception as e:
-
-        print(f"Telegram HATASI: {e}")
-
-        return False
-
-
-# ==========================================
-# SEMBOL
-# ==========================================
-
-def split_symbol(symbol):
-
-    # BTCUSDT -> BTC / USDT
-
-    if symbol.endswith("USDT"):
-        return symbol[:-4], "USDT"
-
-    raise ValueError(
-        f"Desteklenmeyen sembol: {symbol}"
-    )
-
-
-# ==========================================
-# CRYPTOCOMPARE VERİSİ
-# ==========================================
-
-def get_data(symbol, timeframe):
-
-    fsym, tsym = split_symbol(symbol)
-
-    config = TIMEFRAMES[timeframe]
-
-    params = {
-        "fsym": fsym,
-        "tsym": tsym,
-        "e": "Binance",
-        "limit": 100,
-        "aggregate": config["aggregate"],
-        "aggregatePredictableTimePeriods": "true"
-    }
-
-    if config["type"] == "hour":
-
-        endpoint = f"{CRYPTOCOMPARE_URL}/histohour"
-
-    else:
-
-        endpoint = f"{CRYPTOCOMPARE_URL}/histoday"
-
-    response = requests.get(
-        endpoint,
-        params=params,
-        timeout=15
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": message
+        },
+        timeout=10
     )
 
     response.raise_for_status()
 
-    result = response.json()
 
-    if result.get("Response") != "Success":
+# ==========================================
+# BYBIT PUBLIC API
+# ==========================================
 
-        raise RuntimeError(
-            result.get(
-                "Message",
-                "CryptoCompare veri hatası"
-            )
+def get_data(symbol, interval):
+
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": interval,
+        "limit": 100
+    }
+
+    response = requests.get(
+        BYBIT_URL,
+        params=params,
+        timeout=10
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("retCode") != 0:
+        raise Exception(
+            f"Bybit API: {data.get('retMsg')}"
         )
 
-    data = result.get("Data", {}).get("Data", [])
+    candles = data["result"]["list"]
 
-    if not data:
+    if not candles:
+        raise Exception("Mum verisi bos.")
 
-        raise RuntimeError(
-            "CryptoCompare veri döndürmedi."
-        )
+    # Bybit en yeni mumu ilk sırada gönderiyor.
+    # Eskiden yeniye sıralıyoruz.
+    candles.reverse()
 
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(
+        candles,
+        columns=[
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "turnover"
+        ]
+    )
 
-    required_columns = [
-        "time",
-        "open",
-        "high",
-        "low",
-        "close"
-    ]
-
-    for column in required_columns:
-
-        if column not in df.columns:
-
-            raise RuntimeError(
-                f"Eksik veri sütunu: {column}"
-            )
-
-    df["time"] = pd.to_datetime(
-        df["time"],
-        unit="s",
-        utc=True
+    df["open_time"] = pd.to_datetime(
+        df["open_time"].astype("int64"),
+        unit="ms"
     )
 
     for column in [
         "open",
         "high",
         "low",
-        "close"
+        "close",
+        "volume",
+        "turnover"
     ]:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    df = df.dropna(
-        subset=["open", "high", "low", "close"]
-    )
-
-    df = df.sort_values("time").reset_index(
-        drop=True
-    )
-
-    # ======================================
-    # AÇILMAMIŞ MUMU ÇIKAR
-    # ======================================
-
-    now = pd.Timestamp.now(
-        tz="UTC"
-    )
-
-    candle_seconds = TIMEFRAMES[
-        timeframe
-    ]["seconds"]
-
-    candle_duration = pd.Timedelta(
-        seconds=candle_seconds
-    )
-
-    if len(df) > 0:
-
-        last_candle_start = df.iloc[-1]["time"]
-
-        last_candle_end = (
-            last_candle_start
-            + candle_duration
-        )
-
-        if last_candle_end > now:
-
-            df = df.iloc[:-1].copy()
-
-    if len(df) < 35:
-
-        raise RuntimeError(
-            "MACD hesaplamak için yeterli "
-            "kapanmış mum yok."
-        )
+        df[column] = df[column].astype(float)
 
     return df
 
@@ -297,10 +148,7 @@ def calculate_macd(df):
         adjust=False
     ).mean()
 
-    df["macd"] = (
-        ema_fast
-        - ema_slow
-    )
+    df["macd"] = ema_fast - ema_slow
 
     df["signal"] = df["macd"].ewm(
         span=MACD_SIGNAL,
@@ -312,29 +160,28 @@ def calculate_macd(df):
 
 # ==========================================
 # CROSS KONTROLÜ
+# SADECE KAPANMIŞ MUM
 # ==========================================
 
 def check_cross(df):
 
-    # Son iki KAPANMIŞ mum
+    # Bybit'in son satırı mevcut/açık mum olabilir.
+    # -2 = son kapanmış mum
+    # -3 = ondan önceki kapanmış mum
 
-    previous = df.iloc[-2]
-    current = df.iloc[-1]
+    previous = df.iloc[-3]
+    current = df.iloc[-2]
 
     bullish = (
-        previous["macd"]
-        <= previous["signal"]
+        previous["macd"] <= previous["signal"]
         and
-        current["macd"]
-        > current["signal"]
+        current["macd"] > current["signal"]
     )
 
     bearish = (
-        previous["macd"]
-        >= previous["signal"]
+        previous["macd"] >= previous["signal"]
         and
-        current["macd"]
-        < current["signal"]
+        current["macd"] < current["signal"]
     )
 
     if bullish:
@@ -347,70 +194,112 @@ def check_cross(df):
 
 
 # ==========================================
+# STATE
+# AYNI CROSS'U TEKRAR GÖNDERME
+# ==========================================
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+        return {}
+
+    try:
+
+        import json
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            return json.load(f)
+
+    except Exception:
+
+        return {}
+
+
+def save_state(state):
+
+    import json
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            state,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+
+# ==========================================
 # ANA PROGRAM
 # ==========================================
 
-print("=" * 42)
+print("==========================================")
 print("MACD TELEGRAM BOT")
-print("=" * 42)
-print("Veri        : CryptoCompare")
-print("Piyasa      : Binance")
-print("Coin sayısı : 10")
+print("==========================================")
+print("Veri        : Bybit Public API")
+print("Piyasa      : USDT Perpetual")
+print("Coin sayisi : 10")
 print("Zamanlar    : 2H / 4H / 12H / 1D")
 print("MACD        : 12 / 26 / 9")
-print("Sinyal      : Kapanmış mum")
+print("Sinyal      : Kapanmis mum")
 print("Tekrar      : Engelli")
-print("=" * 42)
-
+print("==========================================")
 print()
 print("MACD kontrolü başladı.")
-print("=" * 42)
+print("==========================================")
 
-
+state = load_state()
 state_changed = False
-
 
 for symbol in SYMBOLS:
 
-    for timeframe_name in TIMEFRAMES:
+    for timeframe_name, interval in TIMEFRAMES.items():
 
         try:
 
             df = get_data(
                 symbol,
-                timeframe_name
+                interval
             )
 
             df = calculate_macd(df)
 
             cross = check_cross(df)
 
+            # Kapanmış mumun zamanı
+            candle_time = str(
+                df.iloc[-2]["open_time"]
+            )
+
+            # Her coin + timeframe için
+            # son gönderilen sinyali ayrı tutuyoruz.
+            state_key = (
+                f"{symbol}_{timeframe_name}"
+            )
+
+            signal_id = None
+
             if cross:
 
-                # Cross'un gerçekleştiği kapanmış mum
-                candle_time = (
-                    df.iloc[-1]["time"]
-                    .isoformat()
+                signal_id = (
+                    f"{candle_time}_{cross}"
                 )
 
-                state_key = (
-                    f"{symbol}_{timeframe_name}"
-                )
-
-                last_alert = state.get(
+                last_signal = state.get(
                     state_key
                 )
 
-                current_alert = {
-                    "candle": candle_time,
-                    "direction": cross
-                }
-
-                # ==================================
-                # AYNI CROSS DAHA ÖNCE BİLDİRİLDİ Mİ?
-                # ==================================
-
-                if last_alert == current_alert:
+                # Daha önce gönderilmişse
+                # tekrar Telegram gönderme.
+                if signal_id == last_signal:
 
                     print(
                         f"Tekrar engellendi | "
@@ -419,49 +308,34 @@ for symbol in SYMBOLS:
                         f"{cross}"
                     )
 
-                    continue
-
-                if cross == "BULLISH":
-
-                    emoji = "🟢"
-                    direction_text = "YÜKSELİŞ"
-
                 else:
 
-                    emoji = "🔴"
-                    direction_text = "DÜŞÜŞ"
+                    if cross == "BULLISH":
+                        emoji = "🟢"
+                    else:
+                        emoji = "🔴"
 
-                message = (
-                    f"{emoji} MACD CROSS\n\n"
-                    f"Coin: {symbol}\n"
-                    f"Zaman: {timeframe_name}\n"
-                    f"Yön: {direction_text}\n\n"
-                    f"MACD: "
-                    f"{df.iloc[-1]['macd']:.6f}\n"
-                    f"Signal: "
-                    f"{df.iloc[-1]['signal']:.6f}"
-                )
-
-                # Önce Telegram gönder
-                sent = send_telegram(
-                    message
-                )
-
-                # Telegram başarılıysa state kaydet
-                if sent:
-
-                    state[state_key] = (
-                        current_alert
+                    message = (
+                        f"{emoji} MACD CROSS\n\n"
+                        f"Coin: {symbol}\n"
+                        f"Zaman: {timeframe_name}\n"
+                        f"Yön: {cross}\n"
+                        f"MACD: "
+                        f"{df.iloc[-2]['macd']:.6f}\n"
+                        f"Signal: "
+                        f"{df.iloc[-2]['signal']:.6f}\n\n"
+                        f"Kaynak: Bybit"
                     )
 
+                    send_telegram(message)
+
+                    state[state_key] = signal_id
                     state_changed = True
 
                     print(
-                        f"{emoji} "
-                        f"{symbol} "
+                        f"{emoji} {symbol} "
                         f"{timeframe_name} "
-                        f"{cross} "
-                        f"→ TELEGRAM GÖNDERİLDİ"
+                        f"{cross}"
                     )
 
             else:
@@ -499,6 +373,6 @@ else:
     print("State değişmedi.")
 
 
-print("=" * 42)
+print("==========================================")
 print("MACD kontrolü tamamlandı.")
-print("=" * 42)
+print("==========================================")
