@@ -34,7 +34,7 @@ MACD_SIGNAL = 9
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = "1921028034"
 
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
 STATE_FILE = "state.json"
 
