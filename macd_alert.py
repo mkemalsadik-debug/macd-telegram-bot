@@ -1,29 +1,30 @@
 import os
 import requests
 import pandas as pd
+import json
 
 # ==========================================
 # AYARLAR
 # ==========================================
 
 SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "DOGEUSDT",
-    "ETHFIUSDT",
-    "AVAXUSDT",
-    "HYPEUSDT",
-    "LITUSDT"
+    "BTC-USDT",
+    "ETH-USDT",
+    "BNB-USDT",
+    "SOL-USDT",
+    "XRP-USDT",
+    "DOGE-USDT",
+    "ETHFI-USDT",
+    "AVAX-USDT",
+    "HYPE-USDT",
+    "LIT-USDT"
 ]
 
 TIMEFRAMES = {
-    "2H": "120",
-    "4H": "240",
-    "12H": "720",
-    "1D": "D"
+    "2H": "2H",
+    "4H": "4H",
+    "12H": "12H",
+    "1D": "1D"
 }
 
 MACD_FAST = 12
@@ -33,9 +34,40 @@ MACD_SIGNAL = 9
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = "1921028034"
 
-BYBIT_URL = "https://api.bybit.com/v5/market/kline"
+OKX_URL = "https://www.okx.com/api/v5/market/candles"
 
 STATE_FILE = "state.json"
+
+
+# ==========================================
+# STATE
+# ==========================================
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+        return {}
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    except Exception:
+        return {}
+
+
+def save_state(state):
+
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            state,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+
+state = load_state()
 
 
 # ==========================================
@@ -45,7 +77,8 @@ STATE_FILE = "state.json"
 def send_telegram(message):
 
     if not TELEGRAM_TOKEN:
-        raise Exception("TELEGRAM_TOKEN bulunamadi.")
+        print("HATA | TELEGRAM_TOKEN bulunamadı.")
+        return
 
     url = (
         f"https://api.telegram.org/"
@@ -58,76 +91,72 @@ def send_telegram(message):
             "chat_id": CHAT_ID,
             "text": message
         },
-        timeout=10
+        timeout=15
     )
 
     response.raise_for_status()
 
 
 # ==========================================
-# BYBIT PUBLIC API
+# OKX VERİSİ
 # ==========================================
 
-def get_data(symbol, interval):
+def get_data(symbol, timeframe):
 
     params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": 100
+        "instId": symbol,
+        "bar": timeframe,
+        "limit": "100"
     }
 
     response = requests.get(
-        BYBIT_URL,
+        OKX_URL,
         params=params,
-        timeout=10
+        timeout=15
     )
 
     response.raise_for_status()
 
-    data = response.json()
+    result = response.json()
 
-    if data.get("retCode") != 0:
+    if result.get("code") != "0":
         raise Exception(
-            f"Bybit API: {data.get('retMsg')}"
+            f"OKX API: {result.get('msg')}"
         )
 
-    candles = data["result"]["list"]
+    data = result.get("data", [])
 
-    if not candles:
-        raise Exception("Mum verisi bos.")
+    if not data:
+        raise Exception("Veri gelmedi.")
 
-    # Bybit en yeni mumu ilk sırada gönderiyor.
-    # Eskiden yeniye sıralıyoruz.
-    candles.reverse()
+    rows = []
 
-    df = pd.DataFrame(
-        candles,
-        columns=[
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "turnover"
-        ]
-    )
+    for candle in data:
 
-    df["open_time"] = pd.to_datetime(
-        df["open_time"].astype("int64"),
-        unit="ms"
-    )
+        # OKX:
+        # 0 timestamp
+        # 1 open
+        # 2 high
+        # 3 low
+        # 4 close
+        # 8 confirm
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "turnover"
-    ]:
-        df[column] = df[column].astype(float)
+        rows.append({
+            "timestamp": int(candle[0]),
+            "open": float(candle[1]),
+            "high": float(candle[2]),
+            "low": float(candle[3]),
+            "close": float(candle[4]),
+            "confirm": candle[8]
+        })
+
+    df = pd.DataFrame(rows)
+
+    # OKX en yeni mumu önce döndürür.
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    # Sadece kapanmış mumlar
+    df = df[df["confirm"] == "1"].reset_index(drop=True)
 
     return df
 
@@ -159,18 +188,16 @@ def calculate_macd(df):
 
 
 # ==========================================
-# CROSS KONTROLÜ
-# SADECE KAPANMIŞ MUM
+# CROSS
 # ==========================================
 
 def check_cross(df):
 
-    # Bybit'in son satırı mevcut/açık mum olabilir.
-    # -2 = son kapanmış mum
-    # -3 = ondan önceki kapanmış mum
+    if len(df) < 3:
+        return None
 
-    previous = df.iloc[-3]
-    current = df.iloc[-2]
+    previous = df.iloc[-2]
+    current = df.iloc[-1]
 
     bullish = (
         previous["macd"] <= previous["signal"]
@@ -194,112 +221,59 @@ def check_cross(df):
 
 
 # ==========================================
-# STATE
-# AYNI CROSS'U TEKRAR GÖNDERME
-# ==========================================
-
-def load_state():
-
-    if not os.path.exists(STATE_FILE):
-        return {}
-
-    try:
-
-        import json
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            return json.load(f)
-
-    except Exception:
-
-        return {}
-
-
-def save_state(state):
-
-    import json
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-
-# ==========================================
-# ANA PROGRAM
+# ANA KONTROL
 # ==========================================
 
 print("==========================================")
 print("MACD TELEGRAM BOT")
 print("==========================================")
-print("Veri        : Bybit Public API")
-print("Piyasa      : USDT Perpetual")
-print("Coin sayisi : 10")
+print("Veri        : OKX Public Market Data")
+print("Coin sayısı : 10")
 print("Zamanlar    : 2H / 4H / 12H / 1D")
 print("MACD        : 12 / 26 / 9")
-print("Sinyal      : Kapanmis mum")
+print("Sinyal      : Kapanmış mum")
 print("Tekrar      : Engelli")
 print("==========================================")
 print()
 print("MACD kontrolü başladı.")
 print("==========================================")
 
-state = load_state()
+
 state_changed = False
+
 
 for symbol in SYMBOLS:
 
-    for timeframe_name, interval in TIMEFRAMES.items():
+    for timeframe_name, timeframe in TIMEFRAMES.items():
 
         try:
 
             df = get_data(
                 symbol,
-                interval
+                timeframe
             )
 
             df = calculate_macd(df)
 
             cross = check_cross(df)
 
-            # Kapanmış mumun zamanı
-            candle_time = str(
-                df.iloc[-2]["open_time"]
-            )
-
-            # Her coin + timeframe için
-            # son gönderilen sinyali ayrı tutuyoruz.
             state_key = (
                 f"{symbol}_{timeframe_name}"
             )
 
-            signal_id = None
-
             if cross:
 
-                signal_id = (
-                    f"{candle_time}_{cross}"
+                candle_timestamp = int(
+                    df.iloc[-1]["timestamp"]
                 )
 
-                last_signal = state.get(
-                    state_key
+                signal_key = (
+                    f"{candle_timestamp}_{cross}"
                 )
 
-                # Daha önce gönderilmişse
-                # tekrar Telegram gönderme.
-                if signal_id == last_signal:
+                # Aynı kapanmış mumdaki aynı
+                # cross daha önce gönderildiyse gönderme.
+                if state.get(state_key) == signal_key:
 
                     print(
                         f"Tekrar engellendi | "
@@ -321,19 +295,19 @@ for symbol in SYMBOLS:
                         f"Zaman: {timeframe_name}\n"
                         f"Yön: {cross}\n"
                         f"MACD: "
-                        f"{df.iloc[-2]['macd']:.6f}\n"
+                        f"{df.iloc[-1]['macd']:.6f}\n"
                         f"Signal: "
-                        f"{df.iloc[-2]['signal']:.6f}\n\n"
-                        f"Kaynak: Bybit"
+                        f"{df.iloc[-1]['signal']:.6f}"
                     )
 
                     send_telegram(message)
 
-                    state[state_key] = signal_id
+                    state[state_key] = signal_key
                     state_changed = True
 
                     print(
-                        f"{emoji} {symbol} "
+                        f"{emoji} "
+                        f"{symbol} "
                         f"{timeframe_name} "
                         f"{cross}"
                     )
@@ -364,15 +338,16 @@ if state_changed:
 
     save_state(state)
 
-    print()
+    print("==========================================")
     print("State güncellendi.")
+    print("==========================================")
 
 else:
 
-    print()
+    print("==========================================")
     print("State değişmedi.")
+    print("==========================================")
 
 
-print("==========================================")
 print("MACD kontrolü tamamlandı.")
 print("==========================================")
